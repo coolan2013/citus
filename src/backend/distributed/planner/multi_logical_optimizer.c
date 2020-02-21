@@ -64,6 +64,9 @@ int LimitClauseRowFetchCount = -1; /* number of rows to fetch from each task */
 double CountDistinctErrorRate = 0.0; /* precision of count(distinct) approximate */
 int CoordinatorAggregationStrategy = COORDINATOR_AGGREGATION_ROW_GATHER;
 
+/* Constant used throughout file */
+static const uint32 masterTableId = 1; /* one table on the master node */
+
 typedef struct MasterAggregateWalkerContext
 {
 	const ExtendedOpNodeProperties *extendedOpNodeProperties;
@@ -240,6 +243,8 @@ static void ProcessWindowFunctionsForWorkerQuery(List *windowClauseList,
 												 List *originalTargetEntryList,
 												 QueryWindowClause *queryWindowClause,
 												 QueryTargetList *queryTargetList);
+static void ProcessWindowFunctionPullUpForWorkerQuery(MultiExtendedOp *originalOpNode,
+													  QueryTargetList *queryTargetList);
 static void ProcessLimitOrderByForWorkerQuery(OrderByLimitReference orderByLimitReference,
 											  Node *originalLimitCount, Node *limitOffset,
 											  List *sortClauseList, List *groupClauseList,
@@ -284,6 +289,8 @@ static Const * MakeIntegerConstInt64(int64 integerValue);
 
 /* Local functions forward declarations for aggregate expression checks */
 static bool RequiresIntermediateRowPullUp(MultiNode *logicalPlanNode);
+static bool CanPushDownExpression(Node *expression,
+								  ExtendedOpNodeProperties *extendedOpNodeProperties);
 static DeferredErrorMessage * DeferErrorIfContainsNonPushdownableAggregate(
 	MultiNode *logicalPlanNode);
 static DeferredErrorMessage * DeferErrorIfUnsupportedArrayAggregate(
@@ -334,8 +341,6 @@ static bool HasOrderByHllType(List *sortClauseList, List *targetList);
 void
 MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 {
-	ListCell *collectNodeCell = NULL;
-	ListCell *tableNodeCell = NULL;
 	MultiNode *logicalPlanNode = (MultiNode *) multiLogicalPlan;
 	bool requiresIntermediateRowPullUp = RequiresIntermediateRowPullUp(logicalPlanNode);
 	List *extendedOpNodeList = FindNodesOfType(logicalPlanNode, T_MultiExtendedOp);
@@ -403,9 +408,9 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 
 	/* pull up collect nodes and merge duplicate collects */
 	List *collectNodeList = FindNodesOfType(logicalPlanNode, T_MultiCollect);
-	foreach(collectNodeCell, collectNodeList)
+	MultiCollect *collectNode = NULL;
+	foreach_ptr(collectNode, collectNodeList)
 	{
-		MultiCollect *collectNode = (MultiCollect *) lfirst(collectNodeCell);
 		PullUpCollectLoop(collectNode);
 	}
 
@@ -425,9 +430,9 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 	ApplyExtendedOpNodes(extendedOpNode, masterExtendedOpNode, workerExtendedOpNode);
 
 	List *tableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
-	foreach(tableNodeCell, tableNodeList)
+	MultiTable *tableNode = NULL;
+	foreach_ptr(tableNode, tableNodeList)
 	{
-		MultiTable *tableNode = (MultiTable *) lfirst(tableNodeCell);
 		if (tableNode->relationId == SUBQUERY_RELATION_ID)
 		{
 			DeferredErrorMessage *error =
@@ -521,11 +526,10 @@ static List *
 OrSelectClauseList(List *selectClauseList)
 {
 	List *orSelectClauseList = NIL;
-	ListCell *selectClauseCell = NULL;
 
-	foreach(selectClauseCell, selectClauseList)
+	Node *selectClause = NULL;
+	foreach_ptr(selectClause, selectClauseList)
 	{
-		Node *selectClause = (Node *) lfirst(selectClauseCell);
 		bool orClause = or_clause(selectClause);
 		if (orClause)
 		{
@@ -734,11 +738,10 @@ static List *
 ListCopyDeep(List *nodeList)
 {
 	List *nodeCopyList = NIL;
-	ListCell *nodeCell = NULL;
 
-	foreach(nodeCell, nodeList)
+	Node *node = NULL;
+	foreach_ptr(node, nodeList)
 	{
-		Node *node = (Node *) lfirst(nodeCell);
 		Node *nodeCopy = copyObject(node);
 
 		nodeCopyList = lappend(nodeCopyList, nodeCopy);
@@ -967,11 +970,10 @@ static List *
 SelectClauseTableIdList(List *selectClauseList)
 {
 	List *tableIdList = NIL;
-	ListCell *selectClauseCell = NULL;
 
-	foreach(selectClauseCell, selectClauseList)
+	Node *selectClause = NULL;
+	foreach_ptr(selectClause, selectClauseList)
 	{
-		Node *selectClause = (Node *) lfirst(selectClauseCell);
 		List *selectColumnList = pull_var_clause_default(selectClause);
 
 		if (list_length(selectColumnList) == 0)
@@ -1077,11 +1079,10 @@ static List *
 TableIdListColumns(List *tableIdList, List *columnList)
 {
 	List *tableColumnList = NIL;
-	ListCell *columnCell = NULL;
 
-	foreach(columnCell, columnList)
+	Var *column = NULL;
+	foreach_ptr(column, columnList)
 	{
-		Var *column = (Var *) lfirst(columnCell);
 		int columnTableId = (int) column->varno;
 
 		bool tableListMember = list_member_int(tableIdList, columnTableId);
@@ -1104,12 +1105,10 @@ static List *
 TableIdListSelectClauses(List *tableIdList, List *selectClauseList)
 {
 	List *tableSelectClauseList = NIL;
-	ListCell *selectClauseCell = NULL;
 
-	foreach(selectClauseCell, selectClauseList)
+	Node *selectClause = NULL;
+	foreach_ptr(selectClause, selectClauseList)
 	{
-		Node *selectClause = (Node *) lfirst(selectClauseCell);
-
 		List *selectColumnList = pull_var_clause_default(selectClause);
 		if (list_length(selectColumnList) == 0)
 		{
@@ -1419,7 +1418,6 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 	List *targetEntryList = originalOpNode->targetList;
 	List *newTargetEntryList = NIL;
 	List *newGroupClauseList = NIL;
-	ListCell *targetEntryCell = NULL;
 	Node *originalHavingQual = originalOpNode->havingQual;
 	Node *newHavingQual = NULL;
 	MasterAggregateWalkerContext walkerContext = { 0 };
@@ -1428,36 +1426,19 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 	walkerContext.columnId = 1;
 
 	/* iterate over original target entries */
-	foreach(targetEntryCell, targetEntryList)
+	TargetEntry *originalTargetEntry = NULL;
+	foreach_ptr(originalTargetEntry, targetEntryList)
 	{
-		TargetEntry *originalTargetEntry = (TargetEntry *) lfirst(targetEntryCell);
 		TargetEntry *newTargetEntry = flatCopyTargetEntry(originalTargetEntry);
 		Expr *originalExpression = originalTargetEntry->expr;
 		Expr *newExpression = NULL;
 
-		bool hasAggregates = contain_aggs_of_level((Node *) originalExpression, 0);
-		bool hasWindowFunction = contain_window_function((Node *) originalExpression);
-
-		/*
-		 * if the aggregate belongs to a window function, it is not mutated, but pushed
-		 * down to worker as it is. Master query should treat that as a Var.
-		 */
-		if (hasAggregates && !hasWindowFunction &&
-			!extendedOpNodeProperties->groupedByDisjointPartitionColumn)
-		{
-			Node *newNode = MasterAggregateMutator((Node *) originalExpression,
-												   &walkerContext);
-			newExpression = (Expr *) newNode;
-		}
-		else
+		if (CanPushDownExpression((Node *) originalExpression, extendedOpNodeProperties))
 		{
 			/*
-			 * The expression does not have any aggregates or the group by
-			 * is on the partition column. We simply make it reference the
-			 * output generated by worker nodes.
+			 * The expression was entirely pushed down to worker.
+			 * We simply make it reference the output generated by worker nodes.
 			 */
-			const uint32 masterTableId = 1; /* only one table on master node */
-
 			Var *column = makeVarFromTargetEntry(masterTableId, originalTargetEntry);
 			column->varattno = walkerContext.columnId;
 			column->varoattno = walkerContext.columnId;
@@ -1470,12 +1451,19 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 
 			newExpression = (Expr *) column;
 		}
+		else
+		{
+			Node *newNode = MasterAggregateMutator((Node *) originalExpression,
+												   &walkerContext);
+			newExpression = (Expr *) newNode;
+		}
 
 		newTargetEntry->expr = newExpression;
 		newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
 	}
 
-	if (!extendedOpNodeProperties->groupedByDisjointPartitionColumn)
+	if (!extendedOpNodeProperties->groupedByDisjointPartitionColumn ||
+		extendedOpNodeProperties->hasNonPushableWindowFunction)
 	{
 		/*
 		 * Not pushing down GROUP BY, need to regroup on coordinator
@@ -1507,6 +1495,13 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 	masterExtendedOpNode->limitCount = originalOpNode->limitCount;
 	masterExtendedOpNode->limitOffset = originalOpNode->limitOffset;
 	masterExtendedOpNode->havingQual = newHavingQual;
+
+	if (extendedOpNodeProperties->hasNonPushableWindowFunction)
+	{
+		masterExtendedOpNode->hasWindowFuncs = originalOpNode->hasWindowFuncs;
+		masterExtendedOpNode->windowClause = originalOpNode->windowClause;
+		masterExtendedOpNode->hasNonPushableWindowFunction = true;
+	}
 
 	return masterExtendedOpNode;
 }
@@ -1541,7 +1536,6 @@ MasterAggregateMutator(Node *originalNode, MasterAggregateWalkerContext *walkerC
 	}
 	else if (IsA(originalNode, Var))
 	{
-		uint32 masterTableId = 1; /* one table on the master node */
 		Var *newColumn = copyObject((Var *) originalNode);
 		newColumn->varno = masterTableId;
 		newColumn->varattno = walkerContext->columnId;
@@ -1573,7 +1567,6 @@ static Expr *
 MasterAggregateExpression(Aggref *originalAggregate,
 						  MasterAggregateWalkerContext *walkerContext)
 {
-	const uint32 masterTableId = 1;  /* one table on the master node */
 	const Index columnLevelsUp = 0;  /* normal column */
 	const AttrNumber argumentId = 1; /* our aggregates have single arguments */
 	AggregateType aggregateType = GetAggregateType(originalAggregate);
@@ -1632,14 +1625,13 @@ MasterAggregateExpression(Aggref *originalAggregate,
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *varList = pull_var_clause_default((Node *) aggregate);
-		ListCell *varCell = NULL;
 		List *uniqueVarList = NIL;
 		int startColumnCount = walkerContext->columnId;
 
 		/* determine unique vars that were placed in target list by worker */
-		foreach(varCell, varList)
+		Var *column = NULL;
+		foreach_ptr(column, varList)
 		{
-			Var *column = (Var *) lfirst(varCell);
 			uniqueVarList = list_append_unique(uniqueVarList, copyObject(column));
 		}
 
@@ -1647,15 +1639,14 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		 * Go over each var inside aggregate and update their varattno's according to
 		 * worker query target entry column index.
 		 */
-		foreach(varCell, varList)
+		Var *columnToUpdate = NULL;
+		foreach_ptr(columnToUpdate, varList)
 		{
-			Var *columnToUpdate = (Var *) lfirst(varCell);
-			ListCell *uniqueVarCell = NULL;
 			int columnIndex = 0;
 
-			foreach(uniqueVarCell, uniqueVarList)
+			Var *currentVar = NULL;
+			foreach_ptr(currentVar, uniqueVarList)
 			{
-				Var *currentVar = (Var *) lfirst(uniqueVarCell);
 				if (equal(columnToUpdate, currentVar))
 				{
 					break;
@@ -2083,7 +2074,6 @@ MasterAverageExpression(Oid sumAggregateType, Oid countAggregateType,
 						AttrNumber *columnId)
 {
 	const char *sumAggregateName = AggregateNames[AGGREGATE_SUM];
-	const uint32 masterTableId = 1;
 	const int32 defaultTypeMod = -1;
 	const Index defaultLevelsUp = 0;
 	const AttrNumber argumentId = 1;
@@ -2197,7 +2187,6 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	bool hasDistinctOn = originalOpNode->hasDistinctOn;
 
 	int originalGroupClauseLength = list_length(originalGroupClauseList);
-	bool queryHasAggregates = TargetListHasAggregates(originalTargetEntryList);
 
 	/* initialize to default values */
 	memset(&queryTargetList, 0, sizeof(queryTargetList));
@@ -2212,9 +2201,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	/* targetProjectionNumber starts from 1 */
 	queryTargetList.targetProjectionNumber = 1;
 
-	/*
-	 * only push down grouping to worker query when pushing down aggregates
-	 */
+	/* only push down grouping to worker query when pushing down aggregates */
 	if (extendedOpNodeProperties->pullUpIntermediateRows)
 	{
 		queryGroupClause.groupClauseList = NIL;
@@ -2241,11 +2228,22 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 									  &queryHavingQual, &queryTargetList,
 									  &queryGroupClause);
 
-	ProcessWindowFunctionsForWorkerQuery(originalWindowClause, originalTargetEntryList,
-										 &queryWindowClause, &queryTargetList);
-
-	if (!extendedOpNodeProperties->pullUpIntermediateRows)
+	if (!extendedOpNodeProperties->hasNonPushableWindowFunction)
 	{
+		ProcessWindowFunctionsForWorkerQuery(originalWindowClause,
+											 originalTargetEntryList,
+											 &queryWindowClause, &queryTargetList);
+	}
+	else
+	{
+		ProcessWindowFunctionPullUpForWorkerQuery(originalOpNode, &queryTargetList);
+	}
+
+	if (!extendedOpNodeProperties->hasNonPushableWindowFunction &&
+		!extendedOpNodeProperties->pullUpIntermediateRows)
+	{
+		bool queryHasAggregates = TargetListHasAggregates(originalTargetEntryList);
+
 		ProcessDistinctClauseForWorkerQuery(originalDistinctClause, hasDistinctOn,
 											queryGroupClause.groupClauseList,
 											queryHasAggregates, &queryDistinctClause,
@@ -2259,10 +2257,12 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 		 * LIMIT and ORDER BY clauses as described below:
 		 *      (1) Creating a new group by clause during aggregate mutation, or
 		 *      (2) Distinct clause is not pushed down
+		 *      (3) Window function needs to be processed before limit
 		 */
 		bool groupByExtended =
 			list_length(queryGroupClause.groupClauseList) > originalGroupClauseLength;
-		if (!groupByExtended && !distinctPreventsLimitPushdown)
+		if (!groupByExtended && !distinctPreventsLimitPushdown &&
+			!extendedOpNodeProperties->hasNonPushableWindowFunction)
 		{
 			/* both sort and limit clauses rely on similar information */
 			OrderByLimitReference limitOrderByReference =
@@ -2329,43 +2329,36 @@ ProcessTargetListForWorkerQuery(List *targetEntryList,
 								QueryTargetList *queryTargetList,
 								QueryGroupClause *queryGroupClause)
 {
-	ListCell *targetEntryCell = NULL;
 	WorkerAggregateWalkerContext workerAggContext = { 0 };
 
 	workerAggContext.extendedOpNodeProperties = extendedOpNodeProperties;
 	workerAggContext.expressionList = NIL;
 
 	/* iterate over original target entries */
-	foreach(targetEntryCell, targetEntryList)
+	TargetEntry *originalTargetEntry = NULL;
+	foreach_ptr(originalTargetEntry, targetEntryList)
 	{
-		TargetEntry *originalTargetEntry = (TargetEntry *) lfirst(targetEntryCell);
 		Expr *originalExpression = originalTargetEntry->expr;
 		List *newExpressionList = NIL;
-		bool hasAggregates = contain_aggs_of_level((Node *) originalExpression, 0);
-		bool hasWindowFunction = contain_window_function((Node *) originalExpression);
 
 		/* reset walker context */
 		workerAggContext.expressionList = NIL;
 		workerAggContext.createGroupByClause = false;
 
 		/*
-		 * If the query has a window function, we currently assume it's safe to push
-		 * down the target list.
-		 *
 		 * If there are aggregates without a GROUP BY on the distribution column
 		 * then the results of those aggregates need to be combined on the coordinator.
 		 * In that case we rewrite the expressions using WorkerAggregateWalker.
 		 */
-		if (!hasWindowFunction && hasAggregates &&
-			!extendedOpNodeProperties->groupedByDisjointPartitionColumn)
+		if (CanPushDownExpression((Node *) originalExpression, extendedOpNodeProperties))
+		{
+			newExpressionList = list_make1(originalExpression);
+		}
+		else
 		{
 			WorkerAggregateWalker((Node *) originalExpression, &workerAggContext);
 
 			newExpressionList = workerAggContext.expressionList;
-		}
-		else
-		{
-			newExpressionList = list_make1(originalExpression);
 		}
 
 		ExpandWorkerTargetEntry(newExpressionList, originalTargetEntry,
@@ -2408,19 +2401,18 @@ ProcessHavingClauseForWorkerQuery(Node *originalHavingQual,
 		 * If the GROUP BY or PARTITION BY is not on the distribution column
 		 * then we need to combine the aggregates in the HAVING across shards.
 		 */
-		WorkerAggregateWalkerContext *workerAggContext = palloc0(
-			sizeof(WorkerAggregateWalkerContext));
+		WorkerAggregateWalkerContext workerAggContext = {
+			.extendedOpNodeProperties = extendedOpNodeProperties,
+			.expressionList = NIL,
+			.createGroupByClause = false,
+		};
 
-		workerAggContext->extendedOpNodeProperties = extendedOpNodeProperties;
-		workerAggContext->expressionList = NIL;
-		workerAggContext->createGroupByClause = false;
-
-		WorkerAggregateWalker(originalHavingQual, workerAggContext);
-		List *newExpressionList = workerAggContext->expressionList;
+		WorkerAggregateWalker(originalHavingQual, &workerAggContext);
+		List *newExpressionList = workerAggContext.expressionList;
 		TargetEntry *targetEntry = NULL;
 
 		ExpandWorkerTargetEntry(newExpressionList, targetEntry,
-								workerAggContext->createGroupByClause,
+								workerAggContext.createGroupByClause,
 								queryTargetList, queryGroupClause);
 	}
 
@@ -2436,7 +2428,8 @@ ProcessHavingClauseForWorkerQuery(Node *originalHavingQual,
 	 *
 	 */
 	if (extendedOpNodeProperties->groupedByDisjointPartitionColumn ||
-		extendedOpNodeProperties->pushDownWindowFunctions)
+		(extendedOpNodeProperties->hasWindowFuncs &&
+		 !extendedOpNodeProperties->hasNonPushableWindowFunction))
 	{
 		/*
 		 * We converted the having expression to a list in subquery pushdown
@@ -2530,11 +2523,6 @@ ProcessDistinctClauseForWorkerQuery(List *distinctClause, bool hasDistinctOn,
  * that worker query's workerWindowClauseList is set when the window clauses are safe to
  * pushdown.
  *
- * TODO: Citus only supports pushing down window clauses as-is under certain circumstances.
- * And, at this point in the planning, we are guaranteed to process a window function
- * which is safe to pushdown as-is. It should also be possible to pull the relevant data
- * to the coordinator and apply the window clauses for the remaining cases.
- *
  * Note that even though Citus only pushes down the window functions, it may need to
  * modify the target list of the worker query when the window function refers to
  * an avg(). The reason is that any aggregate which is also referred by other
@@ -2552,8 +2540,6 @@ ProcessWindowFunctionsForWorkerQuery(List *windowClauseList,
 									 QueryWindowClause *queryWindowClause,
 									 QueryTargetList *queryTargetList)
 {
-	ListCell *windowClauseCell = NULL;
-
 	if (windowClauseList == NIL)
 	{
 		queryWindowClause->hasWindowFunctions = false;
@@ -2561,10 +2547,9 @@ ProcessWindowFunctionsForWorkerQuery(List *windowClauseList,
 		return;
 	}
 
-	foreach(windowClauseCell, windowClauseList)
+	WindowClause *windowClause = NULL;
+	foreach_ptr(windowClause, windowClauseList)
 	{
-		WindowClause *windowClause = (WindowClause *) lfirst(windowClauseCell);
-
 		List *partitionClauseTargetList =
 			GenerateNewTargetEntriesForSortClauses(originalTargetEntryList,
 												   windowClause->partitionClause,
@@ -2596,6 +2581,41 @@ ProcessWindowFunctionsForWorkerQuery(List *windowClauseList,
 
 	queryWindowClause->workerWindowClauseList = windowClauseList;
 	queryWindowClause->hasWindowFunctions = true;
+}
+
+
+/* ProcessWindowFunctionPullUpForWorkerQuery pulls up inputs for window functions */
+static void
+ProcessWindowFunctionPullUpForWorkerQuery(MultiExtendedOp *originalOpNode,
+										  QueryTargetList *queryTargetList)
+{
+	if (originalOpNode->windowClause != NIL)
+	{
+		List *columnList = pull_var_clause_default((Node *) originalOpNode->windowClause);
+		StringInfoData columnNameString;
+		initStringInfo(&columnNameString);
+
+		Expr *newExpression = NULL;
+		foreach_ptr(newExpression, columnList)
+		{
+			TargetEntry *newTargetEntry = makeNode(TargetEntry);
+
+			newTargetEntry->expr = newExpression;
+
+			resetStringInfo(&columnNameString);
+			appendStringInfo(&columnNameString, WORKER_COLUMN_FORMAT,
+							 queryTargetList->targetProjectionNumber);
+			newTargetEntry->resname = columnNameString.data;
+
+			/* force resjunk to false as we may need this on the master */
+			newTargetEntry->resjunk = false;
+			newTargetEntry->resno = queryTargetList->targetProjectionNumber;
+
+			queryTargetList->targetEntryList =
+				lappend(queryTargetList->targetEntryList, newTargetEntry);
+			queryTargetList->targetProjectionNumber++;
+		}
+	}
 }
 
 
@@ -2672,16 +2692,14 @@ BuildOrderByLimitReference(bool hasDistinctOn, bool groupedByDisjointPartitionCo
 /*
  * TargetListHasAggregates returns true if any of the elements in the
  * target list contain aggregates that are not inside the window functions.
+ * This function should not be called if window functions are being pulled up.
  */
 static bool
 TargetListHasAggregates(List *targetEntryList)
 {
-	ListCell *targetEntryCell = NULL;
-
-	/* iterate over original target entries */
-	foreach(targetEntryCell, targetEntryList)
+	TargetEntry *targetEntry = NULL;
+	foreach_ptr(targetEntry, targetEntryList)
 	{
-		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
 		Expr *targetExpr = targetEntry->expr;
 		bool hasAggregates = contain_aggs_of_level((Node *) targetExpr, 0);
 		bool hasWindowFunction = contain_window_function((Node *) targetExpr);
@@ -2722,13 +2740,10 @@ ExpandWorkerTargetEntry(List *expressionList, TargetEntry *originalTargetEntry,
 						bool addToGroupByClause, QueryTargetList *queryTargetList,
 						QueryGroupClause *queryGroupClause)
 {
-	ListCell *newExpressionCell = NULL;
-
 	/* now create target entries for each new expression */
-	foreach(newExpressionCell, expressionList)
+	Expr *newExpression = NULL;
+	foreach_ptr(newExpression, expressionList)
 	{
-		Expr *newExpression = (Expr *) lfirst(newExpressionCell);
-
 		/* generate and add the new target entry to the target list */
 		TargetEntry *newTargetEntry =
 			GenerateWorkerTargetEntry(originalTargetEntry, newExpression,
@@ -2760,14 +2775,12 @@ ExpandWorkerTargetEntry(List *expressionList, TargetEntry *originalTargetEntry,
 static Index
 GetNextSortGroupRef(List *targetEntryList)
 {
-	ListCell *targetEntryCell = NULL;
 	Index nextSortGroupRefIndex = 0;
 
 	/* find max of sort group ref index */
-	foreach(targetEntryCell, targetEntryList)
+	TargetEntry *targetEntry = NULL;
+	foreach_ptr(targetEntry, targetEntryList)
 	{
-		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
-
 		if (targetEntry->ressortgroupref > nextSortGroupRefIndex)
 		{
 			nextSortGroupRefIndex = targetEntry->ressortgroupref;
@@ -2951,10 +2964,10 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *columnList = pull_var_clause_default((Node *) aggregate);
-		ListCell *columnCell = NULL;
-		foreach(columnCell, columnList)
+
+		Var *column = NULL;
+		foreach_ptr(column, columnList)
 		{
-			Var *column = (Var *) lfirst(columnCell);
 			workerAggregateList = list_append_unique(workerAggregateList, column);
 		}
 
@@ -3078,7 +3091,6 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 
 		if (combine != InvalidOid)
 		{
-			ListCell *originalAggArgCell;
 			Oid workerPartialId = WorkerPartialAggOid();
 
 			Const *aggOidParam = makeConst(REGPROCEDUREOID, -1, InvalidOid, sizeof(Oid),
@@ -3086,9 +3098,9 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 										   false, true);
 			List *aggArguments = list_make1(makeTargetEntry((Expr *) aggOidParam, 1, NULL,
 															false));
-			foreach(originalAggArgCell, originalAggregate->args)
+			TargetEntry *arg = NULL;
+			foreach_ptr(arg, originalAggregate->args)
 			{
-				TargetEntry *arg = lfirst(originalAggArgCell);
 				TargetEntry *newArg = copyObject(arg);
 				newArg->resno++;
 				aggArguments = lappend(aggArguments, newArg);
@@ -3535,6 +3547,39 @@ RequiresIntermediateRowPullUp(MultiNode *logicalPlanNode)
 
 
 /*
+ * RequiresPushdown returns whether the expression can be pushed down to workers.
+ */
+static bool
+CanPushDownExpression(Node *expression,
+					  ExtendedOpNodeProperties *extendedOpNodeProperties)
+{
+	bool hasAggregate = contain_aggs_of_level(expression, 0);
+	bool hasWindowFunction = contain_window_function(expression);
+	bool hasPushableWindowFunction =
+		hasWindowFunction && !extendedOpNodeProperties->hasNonPushableWindowFunction;
+
+	if (!hasAggregate && !hasWindowFunction)
+	{
+		return true;
+	}
+
+	/* aggregates inside pushed down window functions can be pushed down */
+	if (hasPushableWindowFunction)
+	{
+		return true;
+	}
+
+	if (hasAggregate && !hasWindowFunction &&
+		extendedOpNodeProperties->groupedByDisjointPartitionColumn)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
  * DeferErrorIfContainsNonPushdownableAggregate extracts aggregate expressions from
  * the logical plan, walks over them and uses helper functions to check if we
  * can transform these aggregate expressions and push them down to worker nodes.
@@ -3555,11 +3600,9 @@ DeferErrorIfContainsNonPushdownableAggregate(MultiNode *logicalPlanNode)
 	List *expressionList = pull_var_clause((Node *) targetList, PVC_INCLUDE_AGGREGATES |
 										   PVC_INCLUDE_WINDOWFUNCS);
 
-	ListCell *expressionCell = NULL;
-	foreach(expressionCell, expressionList)
+	Node *expression = NULL;
+	foreach_ptr(expression, expressionList)
 	{
-		Node *expression = (Node *) lfirst(expressionCell);
-
 		/* only consider aggregate expressions */
 		if (!IsA(expression, Aggref))
 		{
@@ -3699,10 +3742,10 @@ DeferErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	{
 		Node *aggregateArgument = (Node *) linitial(aggregateExpression->args);
 		List *columnList = pull_var_clause_default(aggregateArgument);
-		ListCell *columnCell = NULL;
-		foreach(columnCell, columnList)
+
+		Var *column = NULL;
+		foreach_ptr(column, columnList)
 		{
-			Var *column = (Var *) lfirst(columnCell);
 			if (column->varattno <= 0)
 			{
 				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
@@ -3715,10 +3758,10 @@ DeferErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	else
 	{
 		List *multiTableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
-		ListCell *multiTableNodeCell = NULL;
-		foreach(multiTableNodeCell, multiTableNodeList)
+
+		MultiTable *multiTable = NULL;
+		foreach_ptr(multiTable, multiTableNodeList)
 		{
-			MultiTable *multiTable = (MultiTable *) lfirst(multiTableNodeCell);
 			if (multiTable->relationId == SUBQUERY_RELATION_ID ||
 				multiTable->relationId == SUBQUERY_PUSHDOWN_RELATION_ID)
 			{
@@ -3871,11 +3914,10 @@ TablePartitioningSupportsDistinct(List *tableNodeList, MultiExtendedOp *opNode,
 								  Var *distinctColumn, AggregateType aggregateType)
 {
 	bool distinctSupported = true;
-	ListCell *tableNodeCell = NULL;
 
-	foreach(tableNodeCell, tableNodeList)
+	MultiTable *tableNode = NULL;
+	foreach_ptr(tableNode, tableNodeList)
 	{
-		MultiTable *tableNode = (MultiTable *) lfirst(tableNodeCell);
 		Oid relationId = tableNode->relationId;
 		bool tableDistinctSupported = false;
 
@@ -3945,11 +3987,10 @@ bool
 GroupedByColumn(List *groupClauseList, List *targetList, Var *column)
 {
 	bool groupedByColumn = false;
-	ListCell *groupClauseCell = NULL;
 
-	foreach(groupClauseCell, groupClauseList)
+	SortGroupClause *groupClause = NULL;
+	foreach_ptr(groupClause, groupClauseList)
 	{
-		SortGroupClause *groupClause = (SortGroupClause *) lfirst(groupClauseCell);
 		TargetEntry *groupTargetEntry = get_sortgroupclause_tle(groupClause, targetList);
 
 		Expr *groupExpression = (Expr *) groupTargetEntry->expr;
@@ -3979,10 +4020,9 @@ SubqueryMultiTableList(MultiNode *multiNode)
 	List *subqueryMultiTableList = NIL;
 	List *multiTableNodeList = FindNodesOfType(multiNode, T_MultiTable);
 
-	ListCell *multiTableNodeCell = NULL;
-	foreach(multiTableNodeCell, multiTableNodeList)
+	MultiTable *multiTable = NULL;
+	foreach_ptr(multiTable, multiTableNodeList)
 	{
-		MultiTable *multiTable = (MultiTable *) lfirst(multiTableNodeCell);
 		Query *subquery = multiTable->subquery;
 
 		if (subquery != NULL)
@@ -4003,11 +4043,10 @@ List *
 GroupTargetEntryList(List *groupClauseList, List *targetEntryList)
 {
 	List *groupTargetEntryList = NIL;
-	ListCell *groupClauseCell = NULL;
 
-	foreach(groupClauseCell, groupClauseList)
+	SortGroupClause *groupClause = NULL;
+	foreach_ptr(groupClause, groupClauseList)
 	{
-		SortGroupClause *groupClause = (SortGroupClause *) lfirst(groupClauseCell);
 		TargetEntry *groupTargetEntry =
 			get_sortgroupclause_tle(groupClause, targetEntryList);
 		groupTargetEntryList = lappend(groupTargetEntryList, groupTargetEntry);
@@ -4140,7 +4179,6 @@ FindReferencedTableColumn(Expr *columnExpression, List *parentQueryList, Query *
 								 rangeTableEntry->ctelevelsup - 1;
 		Query *cteParentQuery = NULL;
 		List *cteList = NIL;
-		ListCell *cteListCell = NULL;
 		CommonTableExpr *cte = NULL;
 
 		/*
@@ -4154,9 +4192,9 @@ FindReferencedTableColumn(Expr *columnExpression, List *parentQueryList, Query *
 			cteList = cteParentQuery->cteList;
 		}
 
-		foreach(cteListCell, cteList)
+		CommonTableExpr *candidateCte = NULL;
+		foreach_ptr(candidateCte, cteList)
 		{
-			CommonTableExpr *candidateCte = (CommonTableExpr *) lfirst(cteListCell);
 			if (strcmp(candidateCte->ctename, rangeTableEntry->ctename) == 0)
 			{
 				cte = candidateCte;
@@ -4392,11 +4430,10 @@ GenerateNewTargetEntriesForSortClauses(List *originalTargetList,
 									   Index *nextSortGroupRefIndex)
 {
 	List *createdTargetList = NIL;
-	ListCell *sortClauseCell = NULL;
 
-	foreach(sortClauseCell, sortClauseList)
+	SortGroupClause *sgClause = NULL;
+	foreach_ptr(sgClause, sortClauseList)
 	{
-		SortGroupClause *sgClause = (SortGroupClause *) lfirst(sortClauseCell);
 		TargetEntry *targetEntry = get_sortgroupclause_tle(sgClause, originalTargetList);
 		Expr *targetExpr = targetEntry->expr;
 		bool containsAggregate = contain_aggs_of_level((Node *) targetExpr, 0);
@@ -4494,11 +4531,10 @@ static bool
 HasOrderByAggregate(List *sortClauseList, List *targetList)
 {
 	bool hasOrderByAggregate = false;
-	ListCell *sortClauseCell = NULL;
 
-	foreach(sortClauseCell, sortClauseList)
+	SortGroupClause *sortClause = NULL;
+	foreach_ptr(sortClause, sortClauseList)
 	{
-		SortGroupClause *sortClause = (SortGroupClause *) lfirst(sortClauseCell);
 		Node *sortExpression = get_sortgroupclause_expr(sortClause, targetList);
 
 		bool containsAggregate = contain_aggs_of_level(sortExpression, 0);
@@ -4521,11 +4557,10 @@ static bool
 HasOrderByNonCommutativeAggregate(List *sortClauseList, List *targetList)
 {
 	bool hasOrderByNonCommutativeAggregate = false;
-	ListCell *sortClauseCell = NULL;
 
-	foreach(sortClauseCell, sortClauseList)
+	SortGroupClause *sortClause = NULL;
+	foreach_ptr(sortClause, sortClauseList)
 	{
-		SortGroupClause *sortClause = (SortGroupClause *) lfirst(sortClauseCell);
 		Node *sortExpression = get_sortgroupclause_expr(sortClause, targetList);
 
 		/* if sort expression is an aggregate, check its type */
@@ -4562,11 +4597,10 @@ static bool
 HasOrderByComplexExpression(List *sortClauseList, List *targetList)
 {
 	bool hasOrderByComplexExpression = false;
-	ListCell *sortClauseCell = NULL;
 
-	foreach(sortClauseCell, sortClauseList)
+	SortGroupClause *sortClause = NULL;
+	foreach_ptr(sortClause, sortClauseList)
 	{
-		SortGroupClause *sortClause = (SortGroupClause *) lfirst(sortClauseCell);
 		Node *sortExpression = get_sortgroupclause_expr(sortClause, targetList);
 
 		/* simple aggregate functions are ok */
@@ -4595,7 +4629,6 @@ static bool
 HasOrderByHllType(List *sortClauseList, List *targetList)
 {
 	bool hasOrderByHllType = false;
-	ListCell *sortClauseCell = NULL;
 
 	/* check whether HLL is loaded */
 	Oid hllId = get_extension_oid(HLL_EXTENSION_NAME, true);
@@ -4607,9 +4640,9 @@ HasOrderByHllType(List *sortClauseList, List *targetList)
 	Oid hllSchemaOid = get_extension_schema(hllId);
 	Oid hllTypeId = TypeOid(hllSchemaOid, HLL_TYPE_NAME);
 
-	foreach(sortClauseCell, sortClauseList)
+	SortGroupClause *sortClause = NULL;
+	foreach_ptr(sortClause, sortClauseList)
 	{
-		SortGroupClause *sortClause = (SortGroupClause *) lfirst(sortClauseCell);
 		Node *sortExpression = get_sortgroupclause_expr(sortClause, targetList);
 
 		Oid sortColumnTypeId = exprType(sortExpression);
@@ -4632,24 +4665,20 @@ HasOrderByHllType(List *sortClauseList, List *targetList)
 bool
 IsGroupBySubsetOfDistinct(List *groupClauses, List *distinctClauses)
 {
-	ListCell *distinctCell = NULL;
-	ListCell *groupCell = NULL;
-
 	/* There must be a group clause */
 	if (list_length(groupClauses) == 0)
 	{
 		return false;
 	}
 
-	foreach(groupCell, groupClauses)
+	SortGroupClause *groupClause = NULL;
+	foreach_ptr(groupClause, groupClauses)
 	{
-		SortGroupClause *groupClause = (SortGroupClause *) lfirst(groupCell);
 		bool isFound = false;
 
-		foreach(distinctCell, distinctClauses)
+		SortGroupClause *distinctClause = NULL;
+		foreach_ptr(distinctClause, distinctClauses)
 		{
-			SortGroupClause *distinctClause = (SortGroupClause *) lfirst(distinctCell);
-
 			if (groupClause->tleSortGroupRef == distinctClause->tleSortGroupRef)
 			{
 				isFound = true;

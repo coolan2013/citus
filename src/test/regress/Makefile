@@ -128,6 +128,9 @@ check-isolation-base: all  $(isolation_test_files)
 	-- $(MULTI_REGRESS_OPTS) $(EXTRA_TESTS)
 
 check-vanilla: all
+	${MAKE} check-vanilla-internal  || ${MAKE} check-vanilla-internal
+
+check-vanilla-internal:
 	$(pg_regress_multi_check) --load-extension=citus --vanillatest
 
 check-multi-mx: all

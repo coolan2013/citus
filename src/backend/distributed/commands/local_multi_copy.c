@@ -75,6 +75,10 @@ WriteTupleToLocalShard(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest, in
 	{
 		if (isBinaryCopy)
 		{
+			/*
+			 * We're going to flush the buffer to disk by effectively doing a full COPY command.
+			 * Hence we also need to add footers to the current buffer.
+			 */
 			AppendCopyBinaryFooters(localCopyOutState);
 		}
 		bool isEndOfCopy = false;
@@ -135,11 +139,17 @@ ShouldSendCopyNow(StringInfo buffer)
 /*
  * DoLocalCopy finds the shard table from the distributed relation id, and copies the given
  * buffer into the shard.
+ * CopyFrom calls ReadFromLocalBufferCallback to read bytes from the buffer as though
+ * it was reading from stdin. It then parses the tuples and writes them to the shardOid table.
  */
 static void
 DoLocalCopy(StringInfo buffer, Oid relationId, int64 shardId, CopyStmt *copyStatement,
 			bool isEndOfCopy)
 {
+	/*
+	 * Set the buffer as a global variable to allow ReadFromLocalBufferCallback to read from it.
+	 * We cannot pass additional arguments to ReadFromLocalBufferCallback.
+	 */
 	LocalCopyBuffer = buffer;
 
 	Oid shardOid = GetShardLocalTableOid(relationId, shardId);

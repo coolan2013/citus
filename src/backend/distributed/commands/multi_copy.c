@@ -164,6 +164,7 @@ struct CopyPlacementState
 	/* State of shard to which the placement belongs to. */
 	CopyShardState *shardState;
 
+	/* node group ID of the placement */
 	int32 groupId;
 
 	/*
@@ -3324,6 +3325,12 @@ InitializeCopyShardState(CopyShardState *shardState,
 }
 
 
+/*
+ * CloneCopyOutStateForLocalCopy creates a shallow copy of the CopyOutState with a new
+ * fe_msgbuf. We keep a separate CopyOutState for every local shard placement, because
+ * in case of local copy we serialize and buffer incoming tuples into fe_msgbuf for each
+ * placement and the serialization functions take a CopyOutState as a parameter.
+ */
 static void
 CloneCopyOutStateForLocalCopy(CopyOutState from, CopyOutState to)
 {
@@ -3351,7 +3358,7 @@ LogLocalCopyExecution(uint64 shardId)
 	{
 		return;
 	}
-	ereport(NOTICE, (errmsg("executing the copy locally for shard")));
+	ereport(NOTICE, (errmsg("executing the copy locally for shard %lu", shardId)));
 }
 
 
